@@ -2,6 +2,7 @@ use rune::{ContextError, Module};
 use rust_embed::RustEmbed;
 use std::collections::HashMap;
 
+mod binary_file;
 pub mod cluster_info;
 mod functions_common;
 pub mod retry_error;
@@ -199,6 +200,24 @@ fn init_fs_module() -> Result<Module, ContextError> {
     fs_module.function_meta(functions_common::read_resource_to_string)?;
     fs_module.function_meta(functions_common::read_resource_lines)?;
     fs_module.function_meta(functions_common::read_resource_words)?;
+
+    fs_module.ty::<binary_file::BinaryFile>()?;
+    fs_module.constant("LE", "le").build()?;
+    fs_module.constant("BE", "be").build()?;
+    fs_module.function_meta(binary_file::open_binary)?;
+    fs_module.function_meta(binary_file::len)?;
+    fs_module.function_meta(binary_file::seek)?;
+    fs_module.function_meta(binary_file::seek_relative)?;
+    fs_module.function_meta(binary_file::read_u32)?;
+    fs_module.function_meta(binary_file::read_i32)?;
+    fs_module.function_meta(binary_file::read_i64)?;
+    fs_module.function_meta(binary_file::read_f32)?;
+    fs_module.function_meta(binary_file::read_f64)?;
+    fs_module.function_meta(binary_file::read_u32_vec)?;
+    fs_module.function_meta(binary_file::read_i32_vec)?;
+    fs_module.function_meta(binary_file::read_i64_vec)?;
+    fs_module.function_meta(binary_file::read_f32_vec)?;
+    fs_module.function_meta(binary_file::read_f64_vec)?;
 
     Ok(fs_module)
 }

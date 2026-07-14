@@ -453,6 +453,71 @@ pub async fn prepare(ctx) {
 ...
 ```
 
+#### Binary files
+
+Fixed-record binary files can be read with `fs::open_binary`, which returns a
+handle supporting positioned, typed reads. Every typed read takes the byte
+order as its first argument: `fs::LE` (little-endian) or `fs::BE`
+(big-endian):
+
+- `fs::open_binary(file_path)` – opens a binary file for reading
+- `f.len()` – file size in bytes
+- `f.seek(offset)` – moves the read position to an absolute byte offset
+- `f.seek_relative(delta)` – moves the read position relative to the current
+  one (negative moves backwards); the resulting position must stay inside
+  the file
+- `f.read_u32(order)`, `f.read_i32(order)`, `f.read_i64(order)` – reads one
+  integer
+- `f.read_f32(order)`, `f.read_f64(order)` – reads one float
+- `f.read_u32_vec(order, count)`, `f.read_i32_vec(order, count)`,
+  `f.read_i64_vec(order, count)`, `f.read_f32_vec(order, count)`,
+  `f.read_f64_vec(order, count)` – reads
+  `count` values into a vector in one buffered read (preferred for reading
+  a whole record)
+
+Reads advance the position; reading past end-of-file returns an error. Since
+`seek` allows computing a record's offset directly, large files can be read
+record by record instead of being loaded into memory up front.
+
+An open file handle cannot be stored in `ctx.data` by `prepare`: user data is
+passed through serialization when the context is cloned for each worker
+thread, and open files are not serializable. Read everything you need in
+`prepare`, or open a per-worker handle in `prepare_worker`:
+
+```rust
+pub async fn prepare(ctx) {
+    let f = fs::open_binary(DATAFILE)?;
+    // example header: record count and per-record element count, as two u32
+    // (8 bytes total - the records start at offset 8)
+    ctx.data.count = f.read_u32(fs::LE)?;
+    ctx.data.record_len = f.read_u32(fs::LE)?;
+}
+
+pub async fn prepare_worker(ctx) {
+    ctx.data.file = fs::open_binary(DATAFILE)?;
+}
+
+pub async fn run(ctx, i) {
+    let record_idx = i % ctx.data.count;
+    ctx.data.file.seek(8 + record_idx * ctx.data.record_len * 4)?;
+    let record = ctx.data.file.read_f32_vec(fs::LE, ctx.data.record_len)?;
+    // ... use record in queries
+}
+```
+
+Concurrent cycles of a worker share its file handle. File calls never yield,
+so a seek and the reads that depend on it are safe as long as no `await` sits
+between them. Keep such sequences together, or wrap them in a non-async
+helper function. This makes an accidental `await` impossible.
+
+```rust
+// Broken under concurrency: the await yields, so another cycle
+// may move the shared position between the seek and the read.
+ctx.data.file.seek(8 + idx * RECORD_BYTES)?;
+let category = ctx.execute_prepared(CATEGORY, [idx]).await?;
+let record = ctx.data.file.read_f32_vec(fs::LE, LEN)?;  // wrong record
+```
+
 ### Parameterizing workloads
 
 Workloads can be parameterized by parameters given from the command line invocation.

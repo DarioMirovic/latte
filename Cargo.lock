@@ -2345,6 +2345,7 @@ dependencies = [
  "serde_json",
  "status-line",
  "strum",
+ "tempfile",
  "testcontainers",
  "thiserror 2.0.18",
  "time",

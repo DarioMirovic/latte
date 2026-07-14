@@ -2,14 +2,14 @@ use crate::scripting::db_error::DbError;
 use hdrhistogram::serialization::interval_log::IntervalLogWriterError;
 use hdrhistogram::serialization::V2DeflateSerializeError;
 use rune::alloc;
-use rune::runtime::{AccessError, RuntimeError, VmError};
+use rune::runtime::{AccessError, Object, RuntimeError, Value, VmError};
 use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum LatteError {
     #[error("Context data could not be serialized: {0}")]
-    ContextDataEncode(#[from] rmp_serde::encode::Error),
+    ContextDataEncode(String),
 
     #[error("Context data could not be deserialized: {0}")]
     ContextDataDecode(#[from] rmp_serde::decode::Error),
@@ -72,6 +72,33 @@ impl From<Box<DbError>> for LatteError {
     }
 }
 
-impl LatteError {}
+impl LatteError {
+    /// Builds the context-data serialization error, naming the top-level
+    /// `data` entries that fail to serialize - rune's serializer reports no
+    /// path information, so without this the user cannot tell which value is
+    /// at fault.
+    pub fn context_data_encode(data: &Value, cause: &rmp_serde::encode::Error) -> Self {
+        let offenders = unserializable_keys(data);
+        let what = if offenders.is_empty() {
+            cause.to_string()
+        } else {
+            format!("{} - {cause}", offenders.join(", "))
+        };
+        LatteError::ContextDataEncode(format!("{what}. Data may only hold plain values"))
+    }
+}
+
+/// Names the top-level `data` entries that cannot be serialized. Serializes
+/// into a sink because entries can be huge (e.g. a packed dataset) and only
+/// the verdict is needed, not the output.
+fn unserializable_keys(data: &Value) -> Vec<String> {
+    let Ok(obj) = data.borrow_ref::<Object>() else {
+        return Vec::new();
+    };
+    obj.iter()
+        .filter(|(_, v)| rmp_serde::encode::write(&mut std::io::sink(), v).is_err())
+        .map(|(k, _)| format!("data.{k}"))
+        .collect()
+}
 
 pub type Result<T> = std::result::Result<T, LatteError>;

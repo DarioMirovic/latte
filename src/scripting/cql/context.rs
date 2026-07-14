@@ -118,7 +118,8 @@ impl Context {
     /// The user data gets passed through serialization and deserialization to avoid
     /// accidental data sharing.
     pub fn clone(&self) -> Result<Self, LatteError> {
-        let serialized = rmp_serde::to_vec(&self.data)?;
+        let serialized = rmp_serde::to_vec(&self.data)
+            .map_err(|e| LatteError::context_data_encode(&self.data, &e))?;
         let deserialized: Value = rmp_serde::from_slice(&serialized)?;
         Ok(Context {
             session: self.session.clone(),

@@ -418,6 +418,34 @@ mod test {
     }
 
     #[test]
+    fn clone_error_names_unserializable_data_entries() {
+        #[derive(rune::Any)]
+        struct FileLike;
+
+        let mut original = test_context();
+        let mut obj = rune::runtime::Object::new();
+        obj.insert(
+            rune::alloc::String::try_from("count").unwrap(),
+            rune::runtime::Value::from(7i64),
+        )
+        .unwrap();
+        obj.insert(
+            rune::alloc::String::try_from("file").unwrap(),
+            rune::runtime::Value::new(FileLike).unwrap(),
+        )
+        .unwrap();
+        original.data = rune::runtime::Value::new(obj).unwrap();
+
+        let message = match original.clone() {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("clone unexpectedly succeeded"),
+        };
+        assert!(message.contains("data.file"), "got: {message}");
+        assert!(!message.contains("data.count"), "got: {message}");
+        assert!(message.contains("plain values"), "got: {message}");
+    }
+
+    #[test]
     fn per_cycle_metrics_rejected_in_prepare_worker() {
         let mut worker = test_context().clone().unwrap();
         assert!(reject_in_setup(&worker, "record_metric").is_ok());

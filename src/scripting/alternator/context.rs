@@ -77,7 +77,8 @@ impl Context {
     }
 
     pub fn clone(&self) -> Result<Self, LatteError> {
-        let serialized = rmp_serde::to_vec(&self.data)?;
+        let serialized = rmp_serde::to_vec(&self.data)
+            .map_err(|e| LatteError::context_data_encode(&self.data, &e))?;
         let deserialized: Value = rmp_serde::from_slice(&serialized)?;
         Ok(Context {
             client: self.client.clone(),

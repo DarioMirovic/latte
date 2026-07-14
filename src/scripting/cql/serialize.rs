@@ -82,30 +82,14 @@ fn serialize_rune_params(
     }
     if let Ok(obj) = value.borrow_ref::<Object>() {
         for col in columns {
-            let cql_val = match obj.get(col.name()) {
-                Some(v) => {
-                    to_scylla_value(v, col.typ()).map_err(|e| SerializationError::new(*e))?
-                }
-                None => Some(CqlValue::Empty),
-            };
-            cql_val
-                .serialize(col.typ(), writer.make_cell_writer())
-                .map_err(SerializationError::new)?;
+            serialize_named_field(obj.get(col.name()), col.typ(), writer)?;
         }
         return Ok(());
     }
     // Handle struct types (rune typed structs)
     if let Ok(rune::runtime::TypeValue::Struct(s)) = value.as_type_value() {
         for col in columns {
-            let cql_val = match s.get(col.name()) {
-                Some(v) => {
-                    to_scylla_value(v, col.typ()).map_err(|e| SerializationError::new(*e))?
-                }
-                None => Some(CqlValue::Empty),
-            };
-            cql_val
-                .serialize(col.typ(), writer.make_cell_writer())
-                .map_err(SerializationError::new)?;
+            serialize_named_field(s.get(col.name()), col.typ(), writer)?;
         }
         return Ok(());
     }
@@ -114,12 +98,55 @@ fn serialize_rune_params(
     )))
 }
 
+/// Serializes one named parameter; a missing key binds as an empty value.
+fn serialize_named_field(
+    v: Option<&Value>,
+    typ: &ColumnType,
+    writer: &mut RowWriter<'_>,
+) -> Result<(), SerializationError> {
+    match v {
+        Some(v) => serialize_rune_cell(v, typ, writer),
+        None => {
+            Some(CqlValue::Empty)
+                .serialize(typ, writer.make_cell_writer())
+                .map_err(SerializationError::new)?;
+            Ok(())
+        }
+    }
+}
+
 /// Serializes a single rune value as a CQL cell.
 fn serialize_rune_cell(
     v: &Value,
     typ: &ColumnType,
     writer: &mut RowWriter<'_>,
 ) -> Result<(), SerializationError> {
+    // A byte string bound to a float vector column is written straight to
+    // the cell (packed little-endian in, wire byte order out), without
+    // materializing per-element values. Nested occurrences (e.g. inside a
+    // list column) take the to_scylla_value path below instead.
+    if let Ok(b) = v.borrow_ref::<rune::runtime::Bytes>() {
+        if let ColumnType::Vector {
+            typ: elem_typ,
+            dimensions,
+            ..
+        } = typ
+        {
+            if matches!(elem_typ.as_ref(), ColumnType::Native(NativeType::Float)) {
+                check_packed_float_len(b.len(), *dimensions as usize, typ)
+                    .map_err(|e| SerializationError::new(*e))?;
+                let mut payload = Vec::with_capacity(b.len());
+                for chunk in b.chunks_exact(4) {
+                    payload.extend_from_slice(&[chunk[3], chunk[2], chunk[1], chunk[0]]);
+                }
+                writer
+                    .make_cell_writer()
+                    .set_value(&payload)
+                    .map_err(SerializationError::new)?;
+                return Ok(());
+            }
+        }
+    }
     let cql_val = to_scylla_value(v, typ).map_err(|e| SerializationError::new(*e))?;
     cql_val
         .serialize(typ, writer.make_cell_writer())
@@ -407,6 +434,33 @@ fn to_scylla_value(v: &Value, typ: &ColumnType) -> Result<Option<CqlValue>, Box<
     if let Ok(b) = v.borrow_ref::<rune::runtime::Bytes>() {
         return match typ {
             ColumnType::Native(NativeType::Blob) => Ok(Some(CqlValue::Blob(b.to_vec()))),
+            // Fallback for byte strings that reach a float vector column
+            // nested inside another value (e.g. an element of a list column):
+            // decodes to per-element values for the driver. Top-level binds
+            // take the direct-to-cell fast path in serialize_rune_cell.
+            ColumnType::Vector {
+                typ: elem_typ,
+                dimensions,
+                ..
+            } => match elem_typ.as_ref() {
+                // Packed little-endian f32, four bytes per element.
+                ColumnType::Native(NativeType::Float) => {
+                    check_packed_float_len(b.len(), *dimensions as usize, typ)?;
+                    let elements = b
+                        .chunks_exact(4)
+                        .map(|c| CqlValue::Float(f32::from_le_bytes(c.try_into().unwrap())))
+                        .collect();
+                    Ok(Some(CqlValue::Vector(elements)))
+                }
+                _ => Err(Box::new(CassError(CassErrorKind::QueryParamConversion(
+                    format!("byte string of {} bytes", b.len()),
+                    format!("{typ:?}"),
+                    Some(format!(
+                        "vector columns with {elem_typ:?} elements do not accept \
+                         packed byte strings"
+                    )),
+                )))),
+            },
             _ => type_mismatch(v, typ),
         };
     }
@@ -591,6 +645,27 @@ fn to_scylla_value(v: &Value, typ: &ColumnType) -> Result<Option<CqlValue>, Box<
     }
 
     type_mismatch(v, typ)
+}
+
+/// Validates that a byte string of `len` bytes exactly fits a float vector
+/// of `dimensions` elements.
+fn check_packed_float_len(
+    len: usize,
+    dimensions: usize,
+    typ: &ColumnType,
+) -> Result<(), Box<CassError>> {
+    let expected = dimensions * 4;
+    if len != expected {
+        return Err(Box::new(CassError(CassErrorKind::QueryParamConversion(
+            format!("byte string of {len} bytes"),
+            format!("{typ:?}"),
+            Some(format!(
+                "a float vector of {dimensions} dimensions needs exactly \
+                 {expected} bytes of packed little-endian f32"
+            )),
+        ))));
+    }
+    Ok(())
 }
 
 fn type_mismatch(v: &Value, typ: &ColumnType) -> Result<Option<CqlValue>, Box<CassError>> {
@@ -1052,6 +1127,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_to_scylla_value_vector_from_packed_bytes() {
+        let mut packed = Vec::new();
+        for f in [1.0f32, -2.5, 3.25] {
+            packed.extend_from_slice(&f.to_le_bytes());
+        }
+        let val = rune::to_value(rune::runtime::Bytes::from_slice(&packed).unwrap()).unwrap();
+        let typ = ColumnType::Vector {
+            typ: Box::new(ColumnType::Native(NativeType::Float)),
+            dimensions: 3,
+        };
+        let result = to_scylla_value(&val, &typ).unwrap().unwrap();
+        assert_eq!(
+            result,
+            CqlValue::Vector(vec![
+                CqlValue::Float(1.0),
+                CqlValue::Float(-2.5),
+                CqlValue::Float(3.25),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_to_scylla_value_vector_from_packed_bytes_bad_length() {
+        let val = rune::to_value(rune::runtime::Bytes::from_slice([0u8; 5]).unwrap()).unwrap();
+        let typ = ColumnType::Vector {
+            typ: Box::new(ColumnType::Native(NativeType::Float)),
+            dimensions: 1,
+        };
+        assert!(to_scylla_value(&val, &typ).is_err());
+    }
+
+    #[test]
+    fn test_to_scylla_value_vector_from_packed_bytes_wrong_dimensions() {
+        // Two floats' worth of bytes bound to a 3-dimensional vector: valid f32
+        // packing but the wrong element count - must fail here, not server-side.
+        let val = rune::to_value(rune::runtime::Bytes::from_slice([0u8; 8]).unwrap()).unwrap();
+        let typ = ColumnType::Vector {
+            typ: Box::new(ColumnType::Native(NativeType::Float)),
+            dimensions: 3,
+        };
+        assert!(to_scylla_value(&val, &typ).is_err());
+    }
+
+    #[test]
+    fn test_to_scylla_value_vector_from_packed_bytes_non_float_elements() {
+        // Length would be right for one double, but only float vectors accept
+        // packed byte strings.
+        let val = rune::to_value(rune::runtime::Bytes::from_slice([0u8; 8]).unwrap()).unwrap();
+        let typ = ColumnType::Vector {
+            typ: Box::new(ColumnType::Native(NativeType::Double)),
+            dimensions: 1,
+        };
+        assert!(to_scylla_value(&val, &typ).is_err());
+    }
+
     // ── RuneQueryParams serialize tests ─────────────────────────────
 
     #[test]
@@ -1171,6 +1302,92 @@ mod tests {
         SerializeRow::serialize(&native_vals, &ctx, &mut native_writer).unwrap();
 
         assert_eq!(rune_buf, native_buf);
+    }
+
+    #[test]
+    fn test_serialize_packed_bytes_same_bytes_as_value_vector() {
+        // The fast path (byte string written straight to the cell) must
+        // produce exactly the wire bytes of the per-element value path.
+        let floats = [1.0f32, -2.5, 3.25];
+        let mut packed = Vec::new();
+        for f in floats {
+            packed.extend_from_slice(&f.to_le_bytes());
+        }
+        let packed_val = rune_vec(vec![rune::to_value(
+            rune::runtime::Bytes::from_slice(packed).unwrap(),
+        )
+        .unwrap()]);
+        let value_val = rune_vec(vec![rune_vec(
+            floats
+                .iter()
+                .map(|f| rune::to_value(*f as f64).unwrap())
+                .collect(),
+        )]);
+
+        let cols = [col_spec(
+            "v",
+            ColumnType::Vector {
+                typ: Box::new(ColumnType::Native(NativeType::Float)),
+                dimensions: 3,
+            },
+        )];
+
+        let packed_buf = do_serialize(&RuneQueryParams::new(Some(&packed_val)), &cols);
+        let value_buf = do_serialize(&RuneQueryParams::new(Some(&value_val)), &cols);
+        assert_eq!(packed_buf, value_buf);
+    }
+
+    #[test]
+    fn test_serialize_packed_bytes_named_param_same_bytes_as_value_vector() {
+        // Named parameters must take the same direct-to-cell path as
+        // positional ones and produce identical wire bytes.
+        let floats = [1.0f32, -2.5, 3.25];
+        let mut packed = Vec::new();
+        for f in floats {
+            packed.extend_from_slice(&f.to_le_bytes());
+        }
+        let packed_val = rune_object(vec![(
+            "v",
+            rune::to_value(rune::runtime::Bytes::from_slice(packed).unwrap()).unwrap(),
+        )]);
+        let value_val = rune_object(vec![(
+            "v",
+            rune_vec(
+                floats
+                    .iter()
+                    .map(|f| rune::to_value(*f as f64).unwrap())
+                    .collect(),
+            ),
+        )]);
+
+        let cols = [col_spec(
+            "v",
+            ColumnType::Vector {
+                typ: Box::new(ColumnType::Native(NativeType::Float)),
+                dimensions: 3,
+            },
+        )];
+
+        let packed_buf = do_serialize(&RuneQueryParams::new(Some(&packed_val)), &cols);
+        let value_buf = do_serialize(&RuneQueryParams::new(Some(&value_val)), &cols);
+        assert_eq!(packed_buf, value_buf);
+    }
+
+    #[test]
+    fn test_serialize_packed_bytes_wrong_length_errors() {
+        let packed_val = rune_vec(vec![rune::to_value(
+            rune::runtime::Bytes::from_slice([0u8; 8]).unwrap(),
+        )
+        .unwrap()]);
+        let cols = [col_spec(
+            "v",
+            ColumnType::Vector {
+                typ: Box::new(ColumnType::Native(NativeType::Float)),
+                dimensions: 3,
+            },
+        )];
+        let err = do_serialize_err(&RuneQueryParams::new(Some(&packed_val)), &cols);
+        assert!(err.to_string().contains("12 bytes"), "got: {err}");
     }
 
     #[test]

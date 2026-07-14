@@ -474,6 +474,10 @@ order as its first argument: `fs::LE` (little-endian) or `fs::BE`
   `f.read_f64_vec(order, count)` – reads
   `count` values into a vector in one buffered read (preferred for reading
   a whole record)
+- `f.read_bytes(count)` – reads `count` raw bytes into a byte string. A byte
+  string holding packed little-endian f32 values can be bound directly to a
+  CQL `vector<float, N>` parameter - this avoids the per-element value
+  representation entirely, which matters for large in-memory datasets
 
 Reads advance the position; reading past end-of-file returns an error. Since
 `seek` allows computing a record's offset directly, large files can be read

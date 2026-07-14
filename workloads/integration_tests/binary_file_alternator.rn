@@ -1,0 +1,48 @@
+//! Alternator twin of `binary_file.rn`: the same binary dataset, with records
+//! stored as DynamoDB binary attribute values instead of a CQL vector column.
+//!
+//! Data file layout: header `count: u32 LE, dimension: u32 LE`, then
+//! `count * dimension` little-endian f32 values.
+
+use latte::*;
+
+const TABLE = latte::param!("table", "binary_file");
+const DATAFILE = latte::param!("datafile", "binary_file_data.bin");
+
+const VECTOR_DIM = 4;
+
+pub async fn schema(db) {
+    db.create_table(TABLE, "pk").await?;
+}
+
+pub async fn prepare(db) {
+    let f = fs::open_binary(DATAFILE)?;
+    let count = f.read_u32(fs::LE)?;
+    let dimension = f.read_u32(fs::LE)?;
+    if dimension != VECTOR_DIM {
+        return Err(`${DATAFILE}: expected ${VECTOR_DIM}-element records, header says ${dimension}`);
+    }
+    db.data.count = count;
+}
+
+pub async fn prepare_worker(db) {
+    if db.worker_id >= db.worker_count {
+        return Err(`invalid worker identity: worker ${db.worker_id} of ${db.worker_count}`);
+    }
+    // An open file handle cannot be passed from `prepare`: `data` is
+    // serialized when cloned for each worker thread, so each worker opens
+    // its own handle here.
+    db.data.file = fs::open_binary(DATAFILE)?;
+}
+
+pub async fn insert(db, i) {
+    let idx = i % db.data.count;
+    db.data.file.seek(8 + idx * VECTOR_DIM * 4)?;
+    let record = db.data.file.read_bytes(VECTOR_DIM * 4)?;
+    db.put(TABLE, #{ pk: `${idx}`, v: record }, ()).await?
+}
+
+pub async fn get(db, i) {
+    let idx = i % db.data.count;
+    db.get(TABLE, #{ pk: `${idx}` }, #{ consistent_read: true }).await?
+}

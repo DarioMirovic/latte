@@ -1,0 +1,66 @@
+//! Integration workload for binary file reading: `prepare` reads the file
+//! header, `prepare_worker` opens a per-worker file handle (open files cannot
+//! cross the per-worker clone of `data`), and inserts bind whole records as
+//! packed byte strings to a `vector<float, N>` column.
+//!
+//! Data file layout: header `count: u32 LE, dimension: u32 LE`, then
+//! `count * dimension` little-endian f32 values.
+
+use latte::*;
+
+const KEYSPACE = latte::param!("keyspace", "latte");
+const TABLE = latte::param!("table", "binary_file");
+const REPLICATION_FACTOR = latte::param!("replication_factor", 3);
+const DATAFILE = latte::param!("datafile", "binary_file_data.bin");
+
+const VECTOR_DIM = 4;
+
+const INSERT = "binary_file__insert";
+const GET = "binary_file__get";
+
+pub async fn schema(db) {
+    db.execute(`
+        CREATE KEYSPACE IF NOT EXISTS ${KEYSPACE}
+        WITH replication = {
+          'class'              : 'NetworkTopologyStrategy',
+          'replication_factor' : ${REPLICATION_FACTOR}
+        }
+    `).await?;
+    db.execute(`CREATE TABLE IF NOT EXISTS ${KEYSPACE}.${TABLE} (
+        id bigint PRIMARY KEY,
+        v vector<float, ${VECTOR_DIM}>
+    )`).await?;
+}
+
+pub async fn prepare(db) {
+    let f = fs::open_binary(DATAFILE)?;
+    let count = f.read_u32(fs::LE)?;
+    let dimension = f.read_u32(fs::LE)?;
+    if dimension != VECTOR_DIM {
+        return Err(`${DATAFILE}: expected ${VECTOR_DIM}-element records, header says ${dimension}`);
+    }
+    db.data.count = count;
+    db.prepare(INSERT, `INSERT INTO ${KEYSPACE}.${TABLE} (id, v) VALUES (:id, :v)`).await?;
+    db.prepare(GET, `SELECT id FROM ${KEYSPACE}.${TABLE} WHERE id = :id`).await?;
+}
+
+pub async fn prepare_worker(db) {
+    if db.worker_id >= db.worker_count {
+        return Err(`invalid worker identity: worker ${db.worker_id} of ${db.worker_count}`);
+    }
+    // An open file handle cannot be passed from `prepare`: `data` is
+    // serialized when cloned for each worker thread, so each worker opens
+    // its own handle here.
+    db.data.file = fs::open_binary(DATAFILE)?;
+}
+
+pub async fn insert(db, i) {
+    let idx = i % db.data.count;
+    db.data.file.seek(8 + idx * VECTOR_DIM * 4)?;
+    let record = db.data.file.read_bytes(VECTOR_DIM * 4)?;
+    db.execute_prepared(INSERT, #{ "id": idx, "v": record }).await?
+}
+
+pub async fn get(db, i) {
+    db.execute_prepared(GET, #{ "id": i % db.data.count }).await?
+}

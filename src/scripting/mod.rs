@@ -218,6 +218,7 @@ fn init_fs_module() -> Result<Module, ContextError> {
     fs_module.function_meta(binary_file::read_i64_vec)?;
     fs_module.function_meta(binary_file::read_f32_vec)?;
     fs_module.function_meta(binary_file::read_f64_vec)?;
+    fs_module.function_meta(binary_file::read_bytes)?;
 
     Ok(fs_module)
 }

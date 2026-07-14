@@ -262,6 +262,39 @@ fn assert_latte_success(result: &CommandResult) {
     );
 }
 
+/// Extracts an integer stat from a summary row such as "Errors [op] 0".
+fn summary_stat(result: &CommandResult, label: &str) -> u64 {
+    result
+        .output
+        .lines()
+        .find_map(|line| {
+            let mut words = line.split_whitespace();
+            if words.next() == Some(label) {
+                words.last().map(str::to_string)
+            } else {
+                None
+            }
+        })
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| {
+            panic!(
+                "no integer {label} stat in latte output:\n{}",
+                result.output
+            )
+        })
+}
+
+/// A `run` command exits successfully even when workload operations fail, so
+/// checking the exit status is not enough - the error count must be zero.
+fn assert_no_errors(result: &CommandResult) {
+    let errors = summary_stat(result, "Errors");
+    assert_eq!(
+        errors, 0,
+        "latte reported {errors} errors:\n{}",
+        result.output
+    );
+}
+
 fn assert_has_throughput_metrics(result: &CommandResult) {
     assert!(
         result.output.contains("thrpt")
@@ -270,6 +303,117 @@ fn assert_has_throughput_metrics(result: &CommandResult) {
         "Expected throughput metrics in latte output:\n{}",
         result.output
     );
+}
+
+/// Writes a mini binary dataset: header (count, dimension as u32 LE), then
+/// count * dimension little-endian f32 values.
+fn binary_dataset_file(count: u32, dim: u32) -> tempfile::NamedTempFile {
+    let mut data = Vec::with_capacity(8 + (count * dim * 4) as usize);
+    data.extend_from_slice(&count.to_le_bytes());
+    data.extend_from_slice(&dim.to_le_bytes());
+    for i in 0..count * dim {
+        data.extend_from_slice(&(i as f32).to_le_bytes());
+    }
+    let datafile = tempfile::NamedTempFile::new().expect("temp data file");
+    std::fs::write(datafile.path(), &data).expect("write data file");
+    datafile
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_latte_alternator_binary_file_workload() {
+    let db = start_scylla().await.expect("Failed to start ScyllaDB");
+
+    let latte = LatteVariant::Alternator;
+    let workload = workload_path("integration_tests/binary_file_alternator.rn");
+    let duration = "10000";
+
+    let datafile = binary_dataset_file(1000, 4);
+    let datafile_param = format!("datafile=\"{}\"", datafile.path().display());
+
+    println!("\n[TEST-INFO] Phase 1: Create the schema ({:?})", latte);
+    latte.schema(&db, &workload, &["-P", datafile_param.as_str()]);
+
+    println!("\n[TEST-INFO] Phase 2: Insert records read from the binary file");
+    // More than one latte thread, so the per-worker file handle opening runs
+    // on worker-cloned contexts.
+    let insert_result = latte.run(
+        &db,
+        &workload,
+        duration,
+        &["-f=insert", "--threads", "2", "-P", datafile_param.as_str()],
+    );
+    assert_latte_success(&insert_result);
+    assert_no_errors(&insert_result);
+    assert_has_throughput_metrics(&insert_result);
+
+    println!("\n[TEST-INFO] Phase 3: Read the inserted items back");
+    let get_result = latte.run(
+        &db,
+        &workload,
+        duration,
+        &["-f=get", "--threads", "2", "-P", datafile_param.as_str()],
+    );
+    assert_latte_success(&get_result);
+    assert_no_errors(&get_result);
+    assert_eq!(
+        summary_stat(&get_result, "Rows"),
+        summary_stat(&get_result, "Requests"),
+        "some reads found no row:\n{}",
+        get_result.output
+    );
+    assert_has_throughput_metrics(&get_result);
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_latte_cql_binary_file_workload() {
+    let db = start_scylla().await.expect("Failed to start ScyllaDB");
+
+    let latte = LatteVariant::Cql;
+    let workload = workload_path("integration_tests/binary_file.rn");
+    let duration = "10000";
+
+    let datafile = binary_dataset_file(1000, 4);
+    let datafile_param = format!("datafile=\"{}\"", datafile.path().display());
+
+    println!("\n[TEST-INFO] Phase 1: Create the schema ({:?})", latte);
+    let rf_args: &[&str] = match db._container {
+        Some(_) => &["-P", "replication_factor=1"], // Running in a single container
+        None => &[],
+    };
+    let schema_args = [&["-P", datafile_param.as_str()], rf_args].concat();
+    latte.schema(&db, &workload, &schema_args);
+
+    println!("\n[TEST-INFO] Phase 2: Insert records read from the binary file");
+    // More than one latte thread, so the per-worker file handle opening runs
+    // on worker-cloned contexts.
+    let insert_result = latte.run(
+        &db,
+        &workload,
+        duration,
+        &["-f=insert", "--threads", "2", "-P", datafile_param.as_str()],
+    );
+    assert_latte_success(&insert_result);
+    assert_no_errors(&insert_result);
+    assert_has_throughput_metrics(&insert_result);
+
+    println!("\n[TEST-INFO] Phase 3: Read the inserted rows back");
+    let get_result = latte.run(
+        &db,
+        &workload,
+        duration,
+        &["-f=get", "--threads", "2", "-P", datafile_param.as_str()],
+    );
+    assert_latte_success(&get_result);
+    assert_no_errors(&get_result);
+    assert_eq!(
+        summary_stat(&get_result, "Rows"),
+        summary_stat(&get_result, "Requests"),
+        "some reads found no row:\n{}",
+        get_result.output
+    );
+    assert_has_throughput_metrics(&get_result);
 }
 
 #[tokio::test]

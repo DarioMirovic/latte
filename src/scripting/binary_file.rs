@@ -1,4 +1,4 @@
-use rune::runtime::{Mut, Ref};
+use rune::runtime::{Bytes, Mut, Ref};
 use rune::Any;
 use std::fs::File;
 use std::io;
@@ -199,6 +199,10 @@ impl BinaryFile {
             .collect())
     }
 
+    pub fn read_bytes(&mut self, count: i64) -> io::Result<Vec<u8>> {
+        self.read_bulk(count, 1, "read_bytes")
+    }
+
     fn read_array<const N: usize>(&mut self) -> io::Result<[u8; N]> {
         let mut buf = [0u8; N];
         self.reader.read_exact(&mut buf)?;
@@ -338,6 +342,16 @@ pub fn read_i64_vec(
     count: i64,
 ) -> io::Result<Vec<i64>> {
     BinaryFile::read_i64_vec(&mut file, ByteOrder::parse(&order)?, count)
+}
+
+/// Reads `count` raw bytes into a byte string, with no interpretation of the
+/// contents. Keeping fixed-size records as raw bytes instead of value vectors
+/// avoids per-element overhead.
+#[rune::function(instance)]
+pub fn read_bytes(mut file: Mut<BinaryFile>, count: i64) -> io::Result<Bytes> {
+    let buf = BinaryFile::read_bytes(&mut file, count)?;
+    // Adopts the Vec allocation instead of copying the bytes.
+    Bytes::try_from(buf).map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e.to_string()))
 }
 
 #[cfg(test)]
@@ -550,6 +564,17 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
         let err = f.read_f32_vec(LE, 5).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn reads_raw_bytes() {
+        let tmp = write_temp(&[1, 2, 3, 4, 5]);
+        let mut f = open(&tmp);
+        assert_eq!(f.read_bytes(4).unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(
+            f.read_bytes(2).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
     }
 
     #[test]

@@ -73,6 +73,7 @@ impl FnRef {
 
 pub const SCHEMA_FN: &str = "schema";
 pub const PREPARE_FN: &str = "prepare";
+pub const PREPARE_WORKER_FN: &str = "prepare_worker";
 pub const ERASE_FN: &str = "erase";
 pub const LOAD_FN: &str = "load";
 
@@ -218,6 +219,10 @@ impl Program {
         self.has_function(&FnRef::new(PREPARE_FN))
     }
 
+    pub fn has_prepare_worker(&self) -> bool {
+        self.has_function(&FnRef::new(PREPARE_WORKER_FN))
+    }
+
     pub fn has_schema(&self) -> bool {
         self.has_function(&FnRef::new(SCHEMA_FN))
     }
@@ -240,6 +245,18 @@ impl Program {
     pub async fn prepare(&mut self, context: &Context) -> Result<(), LatteError> {
         let context = SessionRef::new(context);
         self.async_call(&FnRef::new(PREPARE_FN), (context,)).await?;
+        Ok(())
+    }
+
+    /// Calls the script's `prepare_worker` function.
+    /// Called once on each worker's clone of the context, before its first
+    /// cycle. Typically used to create per-worker state that cannot be passed
+    /// from `prepare` through the serialized clone of `data`, such as open
+    /// file handles.
+    pub async fn prepare_worker(&mut self, context: &Context) -> Result<(), LatteError> {
+        let context = SessionRef::new(context);
+        self.async_call(&FnRef::new(PREPARE_WORKER_FN), (context,))
+            .await?;
         Ok(())
     }
 
@@ -412,6 +429,25 @@ impl Workload {
                 self.state.try_lock().unwrap().functions(),
             )),
         })
+    }
+
+    /// Runs the script's optional `prepare_worker` function on this
+    /// workload's context. Called on each worker clone before its first
+    /// cycle.
+    pub async fn prepare_worker(
+        &mut self,
+        worker_id: u64,
+        worker_count: u64,
+    ) -> Result<(), LatteError> {
+        self.context.worker_id = worker_id;
+        self.context.worker_count = worker_count;
+        if self.program.has_prepare_worker() {
+            self.context.in_prepare_worker = true;
+            let result = self.program.prepare_worker(&self.context).await;
+            self.context.in_prepare_worker = false;
+            result?;
+        }
+        Ok(())
     }
 
     /// Executes a single cycle of a workload.

@@ -334,7 +334,7 @@ fn reject_in_workload(ctx: &Context, function: &str) -> Result<(), VmError> {
         return Err(VmError::panic(format!(
             "{function} is only allowed in single-threaded setup functions \
              such as prepare, schema or erase; called from a workload function \
-             it would have no effect. Use record_metric for per-cycle values."
+             or prepare_worker it would have no effect. Use record_metric for per-cycle values."
         )));
     }
     Ok(())
@@ -344,11 +344,11 @@ fn reject_in_workload(ctx: &Context, function: &str) -> Result<(), VmError> {
 /// run on the original context whose stats are reset before the run, so the
 /// value would be silently dropped. The mirror of `reject_in_workload`.
 fn reject_in_setup(ctx: &Context, function: &str) -> Result<(), VmError> {
-    if !ctx.is_worker_clone {
+    if !ctx.is_worker_clone || ctx.in_prepare_worker {
         return Err(VmError::panic(format!(
             "{function} only takes effect inside workload functions; called from \
-             a setup function such as prepare, schema or erase its value would be \
-             discarded before the run."
+             a setup function such as prepare, prepare_worker, schema or erase its \
+             value would be discarded before the run."
         )));
     }
     Ok(())
@@ -415,6 +415,32 @@ mod test {
             ValidationStrategy::Ignore,
             0,
         )
+    }
+
+    #[test]
+    fn per_cycle_metrics_rejected_in_prepare_worker() {
+        let mut worker = test_context().clone().unwrap();
+        assert!(reject_in_setup(&worker, "record_metric").is_ok());
+
+        // While prepare_worker runs, per-cycle stats would be cleared before
+        // the run starts, so recording them must fail loudly instead.
+        worker.in_prepare_worker = true;
+        assert!(reject_in_setup(&worker, "record_metric").is_err());
+        // The flag must survive the shallow clone handed to the script.
+        assert!(worker.shallow_clone().in_prepare_worker);
+    }
+
+    #[test]
+    fn worker_identity_defaults_and_propagates() {
+        let original = test_context();
+        assert_eq!(original.worker_id, 0);
+        assert_eq!(original.worker_count, 1);
+
+        let mut worker = original.clone().unwrap();
+        worker.worker_id = 3;
+        worker.worker_count = 8;
+        assert_eq!(worker.shallow_clone().worker_id, 3);
+        assert_eq!(worker.shallow_clone().worker_count, 8);
     }
 
     #[test]

@@ -324,14 +324,18 @@ pub async fn par_execute(
     let mut streams = Vec::with_capacity(thread_count);
     let mut stats = Recorder::start(rate, concurrency, keep_log, hdrh_writer);
 
-    for _ in 0..thread_count {
+    for worker_id in 0..thread_count {
+        let mut worker = workload.clone()?;
+        worker
+            .prepare_worker(worker_id as u64, thread_count as u64)
+            .await?;
         let s = spawn_stream(
             concurrency,
             rate.map(|r| r / (thread_count as f64)),
             rate_sine_amplitude,
             rate_sine_frequency,
             sampling,
-            workload.clone()?,
+            worker,
             deadline.share(),
             progress.clone(),
         );

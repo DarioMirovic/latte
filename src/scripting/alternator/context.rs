@@ -30,6 +30,17 @@ pub struct Context {
     /// Run-level state written through such a copy (report metadata, metric
     /// orientations) is never merged back, so the scripting API rejects those calls.
     pub is_worker_clone: bool,
+    /// True while the script's `prepare_worker` function runs on this context.
+    /// Per-cycle stats written during it (e.g. metrics) are cleared before the
+    /// run starts, so the scripting API rejects those calls.
+    pub in_prepare_worker: bool,
+    /// 0-based index of this worker among `worker_count` workers; 0 on the
+    /// main context used by setup functions.
+    #[rune(get, copy)]
+    pub worker_id: u64,
+    /// Number of worker threads in the run; 1 on the main context.
+    #[rune(get, copy)]
+    pub worker_count: u64,
     #[rune(get)]
     pub data: Value,
 }
@@ -58,6 +69,9 @@ impl Context {
             partition_row_presets: Arc::new(TryLock::new(HashMap::new())),
             load_cycle_count: 0,
             is_worker_clone: false,
+            in_prepare_worker: false,
+            worker_id: 0,
+            worker_count: 1,
             data: Value::new(Object::new()).unwrap(),
         }
     }
@@ -84,6 +98,9 @@ impl Context {
             )),
             load_cycle_count: self.load_cycle_count,
             is_worker_clone: true,
+            in_prepare_worker: false,
+            worker_id: self.worker_id,
+            worker_count: self.worker_count,
             data: deserialized,
         })
     }
@@ -104,6 +121,9 @@ impl Context {
             partition_row_presets: Arc::clone(&self.partition_row_presets),
             load_cycle_count: self.load_cycle_count,
             is_worker_clone: self.is_worker_clone,
+            in_prepare_worker: self.in_prepare_worker,
+            worker_id: self.worker_id,
+            worker_count: self.worker_count,
             data: self.data.clone(),
         }
     }

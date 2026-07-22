@@ -323,6 +323,12 @@ We do:
 - Define required `schema` function as shown above
 - Define optional `prepare` function which runs once before the latte workload and useful
   for setting and pre-calculating things needed to be done once for whole workload.
+- Define optional `prepare_worker` function which runs once on each worker thread's copy
+  of the context, after `prepare` and before the first cycle. Worker threads receive
+  `ctx.data` as a serialized copy, so state that cannot be serialized - such as open
+  file handles - must be created here instead of in `prepare`. The context exposes
+  `ctx.worker_id` (0-based) and `ctx.worker_count`, so workers can partition work
+  among themselves without overlaps.
 - Define any public-facing rune function (name must not overlap with the reserved ones).
   - If we plan to have just 1 rune function, we can call it `run` and avoid specifying the `-f` parameter.
   - If we plan to have 2+ rune functions then we use the `-f / --function ` latte parameter.
